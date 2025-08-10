@@ -1,1 +1,1 @@
-pip install pip==25.0
+pip install pip==25.2
