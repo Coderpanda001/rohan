@@ -6,3 +6,4 @@ numpy==1.24.3
 tensorflow==2.13.0
 ta
 scikit-learn
+pip install pip==25.0
