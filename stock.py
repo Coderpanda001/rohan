@@ -1,96 +1,137 @@
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import yfinance as yf
-import os
+import plotly.graph_objs as go
+from ta.trend import SMAIndicator, EMAIndicator
+from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands
 from datetime import datetime
+from tensorflow import keras
 from sklearn.preprocessing import MinMaxScaler
 
-# Try importing load_model
-try:
-    from keras.models import load_model
-except ImportError as e:
-    st.error("❌ TensorFlow/Keras is not installed. Install with: pip install tensorflow-cpu==2.14.0 keras")
-    st.stop()
+# ----------- Config ----------------
+LOOKBACK = 100  # as trained in your notebook
 
-# Title
-st.title("📈 Stock Price Predictor App")
+st.set_page_config(page_title="Stock Market + LSTM Prediction", layout='wide')
+st.title("📈 Stock Market Analysis & LSTM Prediction")
 
-# Stock input
-stock = st.text_input("Enter Stock Symbol (e.g., AAPL, GOOG)", "GOOG")
+# ----------- Sidebar ----------------
+with st.sidebar:
+    st.header('Settings')
+    stocks = st.multiselect(
+        "Select Stocks:",
+        ['AAPL', 'MSFT', 'GOOG', 'TSLA', 'AMZN', 'META', 'NVDA', 'NFLX'],
+        default=['AAPL', 'MSFT', 'GOOG', 'TSLA']
+    )
+    date_range = st.date_input(
+        "Select Date Range:",
+        [datetime.now().replace(year=datetime.now().year - 1), datetime.now()]
+    )
+    show_ta = st.multiselect(
+        "Indicators:",
+        ['SMA (20)', 'EMA (20)', 'RSI (14)', 'Bollinger Bands'],
+        default=['SMA (20)', 'RSI (14)']
+    )
+    chart_type = st.radio("Chart type:", ('Candlestick', 'Line'))
+    show_prediction = st.checkbox("Show LSTM Price Prediction", value=True)
 
-# Load the trained model
-model_path = "stock.keras"
-if not os.path.exists(model_path):
-    st.error(f"❌ Model file '{model_path}' not found. Please place it in the same folder as this script.")
-    st.stop()
+start_date, end_date = date_range
 
-model = load_model(model_path)
+# ----------- Load Model --------------
+@st.cache_resource
+def load_lstm_model():
+    return keras.models.load_model("stock.keras", compile=False)
 
-# Download stock data
-end = datetime.now()
-start = datetime(end.year - 20, end.month, end.day)
-data = yf.download(stock, start, end)
+model = None
+if show_prediction:
+    try:
+        model = load_lstm_model()
+    except Exception as e:
+        st.error(f"Could not load stock.keras: {e}")
 
-if data.empty:
-    st.error("❌ No stock data found for this symbol.")
-    st.stop()
+# ----------- Data Fetch & Technical Indicators ---------
+def get_stock_data(ticker):
+    df = yf.download(ticker, start=start_date, end=end_date)
+    if df.empty:
+        return df
+    if 'SMA (20)' in show_ta:
+        df['SMA20'] = SMAIndicator(df['Close'], 20).sma_indicator()
+    if 'EMA (20)' in show_ta:
+        df['EMA20'] = EMAIndicator(df['Close'], 20).ema_indicator()
+    if 'RSI (14)' in show_ta:
+        df['RSI14'] = RSIIndicator(df['Close'], 14).rsi()
+    if 'Bollinger Bands' in show_ta:
+        bb = BollingerBands(df['Close'], 20)
+        df['bb_high'] = bb.bollinger_hband()
+        df['bb_low'] = bb.bollinger_lband()
+    return df
 
-st.subheader("Stock Data")
-st.write(data)
+# ----------- Prediction Function (matches training) ---------
+def predict_next_close(df):
+    if model is None or len(df) < LOOKBACK:
+        return None
 
-# Train/test split
-split_idx = int(len(data) * 0.7)
-test_data = pd.DataFrame(data.Close[split_idx:])
+    # Use only Close price as was done in training
+    close_data = df[['Close']].values  
 
-# Function to plot graphs
-def plot_graph(figsize, values, full_data, extra_data=False, extra_dataset=None):
-    fig = plt.figure(figsize=figsize)
-    plt.plot(values, 'orange')
-    plt.plot(full_data.Close, 'b')
-    if extra_data:
-        plt.plot(extra_dataset)
-    return fig
+    # Scale data
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(close_data)
 
-# Moving averages
-for days in [250, 200, 100]:
-    st.subheader(f"Close Price and {days}-Day MA")
-    data[f"MA_for_{days}_days"] = data.Close.rolling(days).mean()
-    st.pyplot(plot_graph((15, 6), data[f"MA_for_{days}_days"], data))
+    # Take last LOOKBACK days for prediction
+    last_window = scaled_data[-LOOKBACK:]  
+    X_test = np.array([last_window])
+    X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
 
-# MA comparison
-st.subheader("MA for 100 days vs 250 days")
-st.pyplot(plot_graph((15, 6), data["MA_for_100_days"], data, True, data["MA_for_250_days"]))
+    pred_scaled = model.predict(X_test)
+    pred_price = scaler.inverse_transform(pred_scaled)
 
-# Prepare data for prediction
-scaler = MinMaxScaler(feature_range=(0, 1))
-scaled_data = scaler.fit_transform(test_data[['Close']])
+    return float(pred_price[0][0])
 
-x_data, y_data = [], []
-for i in range(100, len(scaled_data)):
-    x_data.append(scaled_data[i - 100:i])
-    y_data.append(scaled_data[i])
+# ----------- Main Dashboard Loop -----------
+for ticker in stocks:
+    df = get_stock_data(ticker)
+    if df.empty:
+        st.warning(f"No data for {ticker}")
+        continue
 
-x_data, y_data = np.array(x_data), np.array(y_data)
+    st.subheader(f"{ticker} Stock Data")
+    tabs = ["Chart", "Indicators Table"]
+    if show_prediction:
+        tabs.append("Prediction")
+    tab_objs = st.tabs(tabs)
 
-# Predictions
-predictions = model.predict(x_data)
-inv_predictions = scaler.inverse_transform(predictions)
-inv_y_data = scaler.inverse_transform(y_data)
+    with tab_objs[0]:
+        fig = go.Figure()
+        if chart_type == 'Candlestick':
+            fig.add_trace(go.Candlestick(
+                x=df.index, open=df['Open'], high=df['High'],
+                low=df['Low'], close=df['Close'], name='Candlestick'
+            ))
+        else:
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df['Close'], mode='lines', name='Close'
+            ))
+        if 'SMA20' in df:
+            fig.add_trace(go.Scatter(x=df.index, y=df['SMA20'], mode='lines', name='SMA 20'))
+        if 'EMA20' in df:
+            fig.add_trace(go.Scatter(x=df.index, y=df['EMA20'], mode='lines', name='EMA 20'))
+        if 'bb_high' in df:
+            fig.add_trace(go.Scatter(x=df.index, y=df['bb_high'], mode='lines', name='BB High', line=dict(dash='dot')))
+            fig.add_trace(go.Scatter(x=df.index, y=df['bb_low'], mode='lines', name='BB Low', line=dict(dash='dot')))
+        fig.update_layout(title=f"{ticker} Price Chart", xaxis_title='Date', yaxis_title='Price')
+        st.plotly_chart(fig, use_container_width=True)
 
-# Results
-results = pd.DataFrame(
-    {"Original": inv_y_data.reshape(-1), "Predicted": inv_predictions.reshape(-1)},
-    index=data.index[split_idx + 100:]
-)
+    with tab_objs[1]:
+        st.dataframe(df.tail(20))
 
-st.subheader("Original vs Predicted Prices")
-st.write(results)
+    if show_prediction:
+        with tab_objs[2]:
+            pred = predict_next_close(df)
+            if pred:
+                st.metric(label=f"Predicted Next Close Price for {ticker}", value=f"${pred:.2f}")
+            else:
+                st.warning("Not enough data to make a prediction.")
 
-# Plot Original vs Predicted
-st.subheader("Close Price vs Predicted Price")
-fig = plt.figure(figsize=(15, 6))
-plt.plot(pd.concat([data.Close[:split_idx + 100], results], axis=0))
-plt.legend(["Training Data", "Original Test Data", "Predicted Data"])
-st.pyplot(fig)
+st.caption("Powered by Streamlit, yfinance, TA, and your stock.keras LSTM model.")
